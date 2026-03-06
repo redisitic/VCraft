@@ -1,0 +1,61 @@
+# Special keeping
+nul
+
+# Prerequisites
+*.com
+*.class
+*.dll
+*.exe
+*.o
+*.so
+*.obj
+*.lib
+*.pdb
+*.ilk
+*.exp
+
+# CMake
+CMakeCache.txt
+CMakeFiles
+CMakeScripts
+Testing
+Makefile
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+CTestTestfile.cmake
+_deps/
+
+# Build directories
+build/
+build-*/
+out/
+bin/
+
+# Visual Studio
+.vs/
+*.sln
+*.vcxproj
+*.vcxproj.user
+*.vcxproj.filters
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# Vulkan / Shaders compiled output
+*.spv
+
+# VS Code / other IDEs
+.vscode/
+.idea/
+*.swp
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db

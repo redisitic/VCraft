@@ -1,0 +1,458 @@
+#version 460
+#extension GL_EXT_ray_query : require
+
+// ============================================================================
+// ReSTIR Per-Vertex Lighting Compute Shader
+//
+// Implements Reservoir-based Spatiotemporal Importance Resampling (ReSTIR)
+// for per-vertex lighting with:
+//   - Direct sun illumination with shadow rays
+//   - Sky area light sampling (hemisphere)
+//   - Ambient occlusion via hemisphere ray queries
+//   - One-bounce global illumination
+//   - Temporal reservoir reuse across frames
+//
+// Each frame generates a small number of candidate light samples per vertex,
+// merges them into a persistent reservoir, and outputs the weighted result.
+// Over multiple frames, this converges to high-quality lighting.
+// ============================================================================
+
+layout(local_size_x = 64) in;
+
+// -- Acceleration structure built from the voxel BLAS/TLAS ----------------
+layout(set = 0, binding = 0) uniform accelerationStructureEXT topLevelAS;
+
+// -- Lighting parameters (updated each frame) -----------------------------
+layout(set = 0, binding = 1) uniform LightParams {
+    vec3  sunDirection;      // world-space, points TOWARD the sun
+    float sunIntensity;
+    vec3  sunColor;
+    float ambientIntensity;
+    vec3  skyColor;
+    uint  vertexCount;
+    uint  frameCount;        // monotonic frame counter for RNG seeding
+    uint  torchCount;
+    uint  restirSamples;
+    uint  restirBounces;
+} params;
+
+// -- Interleaved vertex buffer (read-write) --------------------------------
+// Layout per vertex: pos(3) + normal(3) + texcoord(2) + lighting(3) + aoFactor(1) = 12 floats
+layout(std430, set = 0, binding = 2) buffer VertexBuffer {
+    float vertices[];
+};
+
+// -- ReSTIR Reservoir buffer (read-write, persistent across frames) --------
+// Layout per vertex: 8 floats
+//   [0..2] = selected sample light contribution (RGB)
+//   [3]    = weightSum (W_sum)
+//   [4..6] = selected sample direction
+//   [7]    = M (number of candidates seen)
+layout(std430, set = 0, binding = 3) buffer ReservoirBuffer {
+    float reservoirs[];
+};
+
+// -- Torch light buffer (read-only) ---------------------------------------
+// Each torch: posX, posY, posZ, radius, colorR, colorG, colorB, intensity
+// = 8 floats per torch
+layout(std430, set = 0, binding = 4) readonly buffer TorchLightBuffer {
+    float torchLights[];
+};
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+const float PI       = 3.14159265358979323846;
+const float TWO_PI   = 6.28318530717958647692;
+const float INV_PI   = 0.31830988618379067154;
+const float EPSILON  = 0.001;
+
+const float AO_RADIUS    = 8.0;    // ambient occlusion ray max distance (blocks)
+const float GI_RADIUS    = 16.0;   // global illumination bounce distance
+const float SHADOW_DIST  = 200.0;  // sun shadow ray max distance
+const float M_MAX        = 30.0;   // reservoir temporal history cap
+
+// ============================================================================
+// Hash-based PRNG
+// ============================================================================
+
+// PCG-style hash for high quality pseudo-random numbers
+uint pcgHash(uint v) {
+    uint state = v * 747796405u + 2891336453u;
+    uint word  = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+// Generate a float in [0,1) from a seed; advances seed
+float randFloat(inout uint seed) {
+    seed = pcgHash(seed);
+    return float(seed) / 4294967296.0;
+}
+
+// ============================================================================
+// Hemisphere sampling
+// ============================================================================
+
+// Cosine-weighted hemisphere sample around normal
+vec3 cosineHemisphere(vec3 normal, inout uint seed) {
+    float u1 = randFloat(seed);
+    float u2 = randFloat(seed);
+
+    float phi      = TWO_PI * u1;
+    float cosTheta = sqrt(u2);
+    float sinTheta = sqrt(1.0 - u2);
+
+    // Build tangent frame
+    vec3 up       = abs(normal.y) < 0.999 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+    vec3 tangent  = normalize(cross(up, normal));
+    vec3 binormal = cross(normal, tangent);
+
+    return normalize(
+        tangent  * cos(phi) * sinTheta +
+        binormal * sin(phi) * sinTheta +
+        normal   * cosTheta
+    );
+}
+
+// Uniform hemisphere sample around normal
+vec3 uniformHemisphere(vec3 normal, inout uint seed) {
+    float u1 = randFloat(seed);
+    float u2 = randFloat(seed);
+
+    float phi      = TWO_PI * u1;
+    float cosTheta = u2;
+    float sinTheta = sqrt(1.0 - u2 * u2);
+
+    vec3 up       = abs(normal.y) < 0.999 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+    vec3 tangent  = normalize(cross(up, normal));
+    vec3 binormal = cross(normal, tangent);
+
+    return normalize(
+        tangent  * cos(phi) * sinTheta +
+        binormal * sin(phi) * sinTheta +
+        normal   * cosTheta
+    );
+}
+
+// ============================================================================
+// Ray query helpers
+// ============================================================================
+
+// Returns true if a ray from origin in direction dir hits something within maxDist
+bool traceOcclusion(vec3 origin, vec3 dir, float maxDist) {
+    rayQueryEXT rq;
+    rayQueryInitializeEXT(
+        rq, topLevelAS,
+        gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT | gl_RayFlagsCullBackFacingTrianglesEXT,
+        0xFF, origin, EPSILON, dir, maxDist
+    );
+    while (rayQueryProceedEXT(rq)) {}
+    return rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT;
+}
+
+// Returns the hit distance, or -1 if no hit. Also returns hit normal approximation.
+float traceDistance(vec3 origin, vec3 dir, float maxDist) {
+    rayQueryEXT rq;
+    rayQueryInitializeEXT(
+        rq, topLevelAS,
+        gl_RayFlagsOpaqueEXT | gl_RayFlagsCullBackFacingTrianglesEXT,
+        0xFF, origin, EPSILON, dir, maxDist
+    );
+    while (rayQueryProceedEXT(rq)) {}
+    if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT) {
+        return rayQueryGetIntersectionTEXT(rq, true);
+    }
+    return -1.0;
+}
+
+// ============================================================================
+// Reservoir operations
+// ============================================================================
+
+struct Reservoir {
+    vec3  sampleLight;   // RGB contribution of selected sample
+    float weightSum;     // accumulated weight sum
+    vec3  sampleDir;     // direction of selected sample
+    float M;             // number of candidates seen
+};
+
+Reservoir loadReservoir(uint idx) {
+    uint base = idx * 8u;
+    Reservoir r;
+    r.sampleLight = vec3(reservoirs[base + 0], reservoirs[base + 1], reservoirs[base + 2]);
+    r.weightSum   = reservoirs[base + 3];
+    r.sampleDir   = vec3(reservoirs[base + 4], reservoirs[base + 5], reservoirs[base + 6]);
+    r.M           = reservoirs[base + 7];
+    return r;
+}
+
+void storeReservoir(uint idx, Reservoir r) {
+    uint base = idx * 8u;
+    reservoirs[base + 0] = r.sampleLight.x;
+    reservoirs[base + 1] = r.sampleLight.y;
+    reservoirs[base + 2] = r.sampleLight.z;
+    reservoirs[base + 3] = r.weightSum;
+    reservoirs[base + 4] = r.sampleDir.x;
+    reservoirs[base + 5] = r.sampleDir.y;
+    reservoirs[base + 6] = r.sampleDir.z;
+    reservoirs[base + 7] = r.M;
+}
+
+// Update reservoir with a new candidate sample using weighted reservoir sampling.
+// Returns true if the new sample was selected.
+bool reservoirUpdate(inout Reservoir r, vec3 candidateLight, vec3 candidateDir,
+                     float weight, inout uint seed) {
+    r.weightSum += weight;
+    r.M += 1.0;
+
+    // Select this sample with probability weight / weightSum
+    if (randFloat(seed) * r.weightSum < weight) {
+        r.sampleLight = candidateLight;
+        r.sampleDir   = candidateDir;
+        return true;
+    }
+    return false;
+}
+
+// ============================================================================
+// Main
+// ============================================================================
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= params.vertexCount) return;
+
+    uint base = idx * 12u;
+
+    vec3 pos    = vec3(vertices[base + 0], vertices[base + 1], vertices[base + 2]);
+    vec3 normal = vec3(vertices[base + 3], vertices[base + 4], vertices[base + 5]);
+
+    // Offset origin slightly along normal to avoid self-intersection
+    vec3 origin = pos + normal * 0.02;
+
+    // Initialize RNG seed from vertex index + frame count
+    uint seed = pcgHash(idx ^ (params.frameCount * 1999u + 31u));
+
+    // =================================================================
+    // Load existing reservoir (temporal reuse)
+    // =================================================================
+    Reservoir r = loadReservoir(idx);
+
+    // On first frame (M==0) or if reservoir is stale, reset
+    // Also reset if frameCount == 0 (forced reset e.g. time change)
+    if (params.frameCount == 0u) {
+        r.sampleLight = vec3(0.0);
+        r.weightSum   = 0.0;
+        r.sampleDir   = vec3(0.0, 1.0, 0.0);
+        r.M           = 0.0;
+    }
+
+    // Clamp temporal history to prevent stale reservoirs from dominating
+    if (r.M >= M_MAX) {
+        // Scale down to keep ratio but limit history
+        float scale = M_MAX / r.M;
+        r.weightSum *= scale;
+        r.M = M_MAX;
+    }
+
+    // =================================================================
+    // Direct sun shadow ray (Analytic, excluded from reservoir)
+    // =================================================================
+    vec3 directLight = vec3(0.0);
+    {
+        vec3 sunDir = normalize(params.sunDirection);
+        float NdotL = max(dot(normal, sunDir), 0.0);
+
+        if (NdotL > 0.0 && params.sunIntensity > 0.0) {
+            bool inShadow = traceOcclusion(origin, sunDir, SHADOW_DIST);
+            float visibility = inShadow ? 0.0 : 1.0;
+            directLight = params.sunColor * params.sunIntensity * NdotL * visibility;
+        }
+    }
+
+    // =================================================================
+    // Candidates: Unified Hemisphere samples (Sky/AO + GI Bounce)
+    // =================================================================
+    for (uint i = 0u; i < params.restirSamples; i++) {
+        vec3 dir = cosineHemisphere(normal, seed);
+        
+        // We use GI_RADIUS as the maximum trace distance.
+        // If the ray escapes (hitDist < 0.0), it hit the sky.
+        // If it hits a surface (hitDist > 0.0), it receives bounce light (if GI is enabled).
+        float hitDist = traceDistance(origin, dir, GI_RADIUS);
+
+        vec3 candidateLight = vec3(0.0);
+        
+        if (hitDist < 0.0) {
+            // Escaped to the sky
+            candidateLight = params.skyColor * params.ambientIntensity * 2.0;
+        } else if (params.restirBounces > 0u) {
+            // Hit a surface: evaluate bounce lighting
+            vec3 hitPos = origin + dir * hitDist;
+            vec3 hitOrigin = hitPos - dir * 0.05;
+
+            // 1. Sun bounce
+            vec3 sunDir = normalize(params.sunDirection);
+            if (params.sunIntensity > 0.0) {
+                bool hitInShadow = traceOcclusion(hitOrigin, sunDir, SHADOW_DIST);
+                if (!hitInShadow) {
+                    candidateLight += params.sunColor * params.sunIntensity * 1.0;
+                }
+            }
+
+            // 2. Torch bounce
+            for (uint t = 0u; t < params.torchCount; t++) {
+                uint tb = t * 8u;
+                vec3  tpos       = vec3(torchLights[tb + 0], torchLights[tb + 1], torchLights[tb + 2]);
+                float tradius    = torchLights[tb + 3];
+                vec3  tcolor     = vec3(torchLights[tb + 4], torchLights[tb + 5], torchLights[tb + 6]);
+                float tintensity = torchLights[tb + 7];
+
+                vec3  toLight = tpos - hitPos;
+                float dist    = length(toLight);
+
+                if (dist > tradius) continue;
+
+                vec3  lightDir = toLight / max(dist, EPSILON);
+
+                float attenuation = tintensity / (1.0 + dist * dist);
+                float edgeFade = 1.0 - smoothstep(tradius * 0.7, tradius, dist);
+                attenuation *= edgeFade;
+
+                bool inShadow = traceOcclusion(hitOrigin, lightDir, dist - EPSILON);
+                if (!inShadow) {
+                    candidateLight += tcolor * attenuation * 1.0;
+                }
+            }
+
+            // 3. Ambient bounce
+            candidateLight += params.skyColor * params.ambientIntensity * 0.15;
+        }
+
+        float targetPdf = length(candidateLight);
+        float sourcePdf = 1.0;  // cosine-weighted, but we fold the cosine into the estimate
+
+        float weight = (sourcePdf > 0.0) ? (targetPdf / sourcePdf) : 0.0;
+        reservoirUpdate(r, candidateLight, dir, weight, seed);
+    }
+
+    // =================================================================
+    // Compute final lighting from reservoir
+    // =================================================================
+    vec3 finalLighting;
+
+    if (r.M > 0.0 && r.weightSum > 0.0) {
+        // ReSTIR estimator: (1/M) * W_sum * selected_sample / target_pdf_of_selected
+        // Since we store the light contribution directly and use target_pdf = length(light),
+        // and the estimator is: W = (1/M) * (W_sum / p_hat(y))
+        // final = W * f(y) where f(y) = sampleLight, p_hat(y) = |sampleLight|
+        //
+        // Simplified: final = sampleLight * (W_sum / (M * |sampleLight|))
+        // Which = sampleLight_normalized * (W_sum / M) when |sampleLight| > 0
+
+        float pHat = length(r.sampleLight);
+        if (pHat > EPSILON) {
+            float W = r.weightSum / (r.M * pHat);
+            finalLighting = r.sampleLight * W;
+        } else {
+            // All candidates had zero contribution
+            finalLighting = vec3(0.0);
+        }
+    } else {
+        finalLighting = vec3(0.0);
+    }
+
+    // Clamp to prevent fireflies
+    finalLighting = clamp(finalLighting, vec3(0.0), vec3(3.0));
+
+    // Temporally accumulate final lighting to smooth out remaining noise
+    // The reservoir buffers the sample weights, but the final evaluated value 
+    // can still jitter depending on what sample was chosen. A simple exponential 
+    // moving average on the final lighting output does wonders for noise reduction.
+    if (params.frameCount > 0u) {
+        vec3 prevLighting = vec3(vertices[base + 8], vertices[base + 9], vertices[base + 10]);
+        
+        // Remove deterministic light from previous frame before blending
+        // The previous frame stored (GI + DirectSun + Torches). To properly temporal
+        // filter ONLY the GI, we subtract the current deterministic light before blending,
+        // then add it back at the end. Since deterministic light doesn't flicker, this works perfectly.
+        
+        // Compute torch light to exclude it from temporal accumulation
+        vec3 torchLightForExclusion = vec3(0.0);
+        for (uint t = 0u; t < params.torchCount; t++) {
+            uint tb = t * 8u;
+            vec3  tpos      = vec3(torchLights[tb + 0], torchLights[tb + 1], torchLights[tb + 2]);
+            float tradius   = torchLights[tb + 3];
+            vec3  tcolor    = vec3(torchLights[tb + 4], torchLights[tb + 5], torchLights[tb + 6]);
+            float tintensity = torchLights[tb + 7];
+
+            vec3  toLight = tpos - pos;
+            float dist    = length(toLight);
+            if (dist > tradius) continue;
+            vec3  lightDir = toLight / max(dist, EPSILON);
+            float NdotL    = max(dot(normal, lightDir), 0.0);
+            if (NdotL <= 0.0) continue;
+            float attenuation = tintensity / (1.0 + dist * dist);
+            float edgeFade = 1.0 - smoothstep(tradius * 0.7, tradius, dist);
+            attenuation *= edgeFade;
+            bool inShadow = traceOcclusion(origin, lightDir, dist - EPSILON);
+            float visibility = inShadow ? 0.0 : 1.0;
+            torchLightForExclusion += tcolor * attenuation * NdotL * visibility;
+        }
+        
+        vec3 prevGI = max(prevLighting - directLight - torchLightForExclusion, vec3(0.0));
+        
+        float alpha = 0.15; // 15% new, 85% old (smooths over ~6-7 frames)
+        finalLighting = mix(prevGI, finalLighting, alpha);
+    }
+
+    // Add deterministic sunlight
+    finalLighting += directLight;
+
+    // =================================================================
+    // Add Analytic Torch Point Lights (with shadow rays)
+    // =================================================================
+    vec3 torchLight = vec3(0.0);
+    for (uint t = 0u; t < params.torchCount; t++) {
+        uint tb = t * 8u;
+        vec3  tpos      = vec3(torchLights[tb + 0], torchLights[tb + 1], torchLights[tb + 2]);
+        float tradius   = torchLights[tb + 3];
+        vec3  tcolor    = vec3(torchLights[tb + 4], torchLights[tb + 5], torchLights[tb + 6]);
+        float tintensity = torchLights[tb + 7];
+
+        vec3  toLight = tpos - pos;
+        float dist    = length(toLight);
+
+        if (dist > tradius) continue;
+
+        vec3  lightDir = toLight / max(dist, EPSILON);
+        float NdotL    = max(dot(normal, lightDir), 0.0);
+
+        if (NdotL <= 0.0) continue;
+
+        float attenuation = tintensity / (1.0 + dist * dist);
+        float edgeFade = 1.0 - smoothstep(tradius * 0.7, tradius, dist);
+        attenuation *= edgeFade;
+
+        bool inShadow = traceOcclusion(origin, lightDir, dist - EPSILON);
+        float visibility = inShadow ? 0.0 : 1.0;
+
+        torchLight += tcolor * attenuation * NdotL * visibility;
+    }
+
+    finalLighting += torchLight;
+
+    // ReSTIR already computes proper AO via hemisphere samples, so we do NOT
+    // apply bakeAO here (would double-darken). The fragment shader applies
+    // bakeAO to its ambient floor only.
+
+    // =================================================================
+    // Store reservoir and write lighting to vertex buffer
+    // =================================================================
+    storeReservoir(idx, r);
+
+    vertices[base +  8] = finalLighting.x;
+    vertices[base +  9] = finalLighting.y;
+    vertices[base + 10] = finalLighting.z;
+}

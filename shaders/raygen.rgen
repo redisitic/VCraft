@@ -1,0 +1,16 @@
+#version 460
+#extension GL_EXT_ray_tracing : require
+
+// Minimal ray generation shader.
+// Required for VkRayTracingPipelineCreateInfoKHR even though the actual
+// lighting work is done via ray queries in vertex_lighting.comp.
+// This shader is effectively a no-op; it exists solely so the ray tracing
+// pipeline object can be created (Vulkan mandates a raygen stage).
+
+layout(location = 0) rayPayloadEXT vec3 hitValue;
+
+layout(set = 0, binding = 0) uniform accelerationStructureEXT topLevelAS;
+
+void main() {
+    hitValue = vec3(0.0);
+}

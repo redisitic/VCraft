@@ -9,9 +9,6 @@ A Minecraft-like voxel engine built with C++20 and Vulkan, featuring fully hardw
   * **Simple Lighting Mode**: Crisp sun shadows, ambient occlusion, and dynamic point lights (torches) with hard shadow rays.
   * **ReSTIR GI Mode**: Advanced Global Illumination using Reservoir Spatio-Temporal Importance Resampling (ReSTIR). Features multi-sample sky-light evaluation, realistic one-bounce light bleeding, and temporal accumulation (EMA) for real-time denoised path tracing.
 * **Dynamic Colored Lights**: Placeable torches acting as physical point lights that participate in GI bouncing.
-* **Day/Night Cycle**: Smoothly transitions sun/moon positions, sky color, and ambient lighting intensity.
-* **Block Interaction**: Voxel raycasting for precision block breaking and placement.
-* **In-Game Console & HUD**: Includes a command parser, a hotbar system, and HUD toggles for clean screenshots.
 
 ## Requirements
 

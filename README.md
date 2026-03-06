@@ -4,11 +4,11 @@ A Minecraft-like voxel engine built with C++20 and Vulkan, featuring fully hardw
 
 ## Features
 
-* **Hardware Ray Tracing**:
-  * Utilizes Vulkan Acceleration Structures (TLAS/BLAS) and Ray Queries in Compute Shaders to evaluate per-vertex lighting.
+* ** Per Vertex Hardware Ray Tracing**:
+  Utilizes Vulkan Acceleration Structures (TLAS/BLAS) and Ray Queries in Compute Shaders to evaluate per-vertex lighting.
   * **Simple Lighting Mode**: Crisp sun shadows, ambient occlusion, and dynamic point lights (torches) with hard shadow rays.
   * **ReSTIR GI Mode**: Advanced Global Illumination using Reservoir Spatio-Temporal Importance Resampling (ReSTIR). Features multi-sample sky-light evaluation, realistic one-bounce light bleeding, and temporal accumulation (EMA) for real-time denoised path tracing.
-  * **Dynamic Colored Lights**: Placeable torches acting as physical point lights that participate in GI bouncing.
+* **Dynamic Colored Lights**: Placeable torches acting as physical point lights that participate in GI bouncing.
 
 ## Requirements
 

@@ -61,23 +61,29 @@ Press `/` in-game to open the console and type commands:
 
 ### Per Vertex Lighing
 
+<img width="1273" height="718" alt="0" src="https://github.com/user-attachments/assets/437b8f17-86dd-4244-864a-7fab67bffd2e" />
 
 
 ### Restir Bounce Lighting
 
+<img width="1271" height="715" alt="1" src="https://github.com/user-attachments/assets/62e4784b-245a-4dcd-87da-c7a8de96ae85" />
 
 
 ### Restir Off
 
+<img width="1272" height="720" alt="2" src="https://github.com/user-attachments/assets/56261f27-12b9-4fb4-9916-eb20e73d2850" />
 
 
 ### Restir On
 
+<img width="1275" height="718" alt="3" src="https://github.com/user-attachments/assets/f9f8bf2e-2640-4aba-a5a3-3077acaff037" />
 
 
 ### Point Shadows
 
+<img width="1277" height="717" alt="Screenshot 2026-03-07 041204" src="https://github.com/user-attachments/assets/0245d2ee-25dc-44b9-ad5e-bde5f6a69573" />
 
 
 ### Minecraft Style Smooth Lighting
 
+<img width="1277" height="712" alt="4" src="https://github.com/user-attachments/assets/61149630-7efc-493c-a51c-26a84b7e96c2" />
